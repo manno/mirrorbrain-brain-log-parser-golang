@@ -6,6 +6,8 @@ import (
 	"log"
 	"bufio"
 	"fmt"
+	"strings"
+	"strconv"
 )
 
 /*
@@ -19,6 +21,7 @@ import (
 */
 
 const ApacheDate = "02/Jan/2006:15:04:05 -0700"
+var PathFilter = os.Getenv("FILTER")
 
 type Entry struct {
 	Date time.Time
@@ -29,7 +32,7 @@ type Entry struct {
 	Ip string
 	Mirror string
 	Net string
-	RedirBytes string
+	RedirRange string
 	RedirSize string
 	Referer string
 	Region string
@@ -48,8 +51,8 @@ type Entries []Entry
 
 func parseTime(timeStr string) time.Time {
 	date, e :=  time.Parse(ApacheDate, timeStr)
-	if e!=nil {
-		return time.Now()
+	if e != nil {
+		log.Fatal("Failed to parse date: ", timeStr)
 	}
 	return date
 }
@@ -68,7 +71,7 @@ func mirrorbrain(data string) (entry *Entry, err error) {
 		action setRequestMethod { entry.RequestMethod = data[marker:p] }
 		action setRequestPath { entry.RequestPath = data[marker:p] }
 		action setRequestProto { entry.RequestProto = data[marker:p] }
-		action setReturn { entry.ReturnCode = data[marker:p] }
+		action setReturnCode { entry.ReturnCode = data[marker:p] }
 		action setSize { entry.Size = data[marker:p] }
 		action setReferer { entry.Referer = data[marker:p] }
 		action setAgent { entry.Agent = data[marker:p] }
@@ -80,7 +83,7 @@ func mirrorbrain(data string) (entry *Entry, err error) {
 		action setASN { entry.Asn = data[marker:p] }
 		action setNet { entry.Net = data[marker:p] }
 		action setRedirSize { entry.RedirSize = data[marker:p] }
-		action setRedirBytes { entry.RedirBytes = data[marker:p] }
+		action setRedirRange { entry.RedirRange = data[marker:p] }
 
 		action LogLineFinished { entry.Parsed = true }
 
@@ -88,34 +91,35 @@ func mirrorbrain(data string) (entry *Entry, err error) {
 		ws0 = ' '{0,};
 		eol = /[\r\n]/ | '\r\n';
 		date = [^\]]+                                                      >mark %setDate;
-		request_method = ( 'GET' | 'POST' | 'HEAD' )                       >mark %setRequestMethod;
+		request_method = ( 'GET' | 'POST' | 'HEAD' | 'OPTIONS' | 'PROPFIND' ) >mark %setRequestMethod;
 		request_path = [^ ]+                                               >mark %setRequestPath;
 		request_proto = ( 'HTTP/1.0' | 'HTTP/1.1' )                        >mark %setRequestProto;
-		return = digit+                                                    >mark %setReturn;
-		size = digit+                                                      >mark %setSize;
-		referer = [^"]+                                                    >mark %setReferer;
-		useragent = [^"]+                                                  >mark %setAgent;
-		request_type = ( 'file' | 'torrent' | 'redirect' | '-' )           >mark %setRequestType;
-		give = ( 'file' | 'torrent' | 'redirect' | '-' )                   >mark %setGivenType;
-		optional = ( alnum+ | '-' );
+		return_code = digit+                                               >mark %setReturnCode;
+		size = ( digit+ | '-' )                                            >mark %setSize;
+		referer = [^"]*                                                    >mark %setReferer;
+		useragent = any*                                                 >mark %setAgent;
+		type_list = ( 'file' | 'torrent' | 'redirect' | 'mirrorlist' | 'meta4' | '-' );
+		request_type = type_list                                           >mark %setRequestType;
+		give = type_list                                                   >mark %setGivenType;
+		optional = ( alnum+ | '-'+ );
 		region = optional                                                  >mark %setRegion;
 		mirror = [^ ]+                                                     >mark %setMirror;
 		country = optional ":" optional                                    >mark %setCountry;
 		asn = 'ASN:' optional                                              >mark %setASN;
 		ip = [0-9\.]+                                                      >mark %setIP;
-		net = [0-9\.\/]+                                                   >mark %setNet; 
+		net = ( [0-9\-\.\/]+ | '-' )                                       >mark %setNet;
 		redir_size = ( digit+ | '-' )                                      >mark %setRedirSize;
-		redir_bytes = ( '-' | 'bytes=' [0-9\-]+ )                          >mark %setRedirBytes;
+		redir_range = ( '-' | 'bytes=' [0-9\-]+(', bytes=' [0-9\-]+)* )    >mark %setRedirRange;
 
-		log_line = ip ws '-' ws '-' ws '[' date ']' ws 
+		log_line = ip ws '-' ws '-' ws '[' date ']' ws
 		'"' request_method ws request_path ws request_proto '"'
-		ws return ws size ws '"' referer '"' ws 
-		'"' useragent '"' ws ws0 
+		ws return_code ws size ws '"' referer '"' ws
+		'"' useragent '"' ws ws0
 		'want:' request_type ws 'give:' give ws
-		'r:' region ws mirror ws ws0 country ws asn ws 
-		'P:' net ws ws0 
+		'r:' region ws mirror ws ws0 country ws asn ws
+		'P:' net ws ws0
 		'size:' redir_size ws
-		redir_bytes eol @LogLineFinished;
+		redir_range eol @LogLineFinished;
 
 		main := log_line;
 
@@ -130,10 +134,10 @@ func mirrorbrain(data string) (entry *Entry, err error) {
 func main() {
 
 	reader := bufio.NewReader(os.Stdin)
+	var sizeByMirror =  make(map[string]int)
 
 	for {
 		line, err := reader.ReadString('\n')
-
 		if err != nil {
 			break
 		}
@@ -142,19 +146,48 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		fmt.Println(entry)
+		if !entry.Parsed {
+			fmt.Println("IP:", entry.Ip)
+			fmt.Println("Date:", entry.Date)
+			fmt.Println("RequestMethod:", entry.RequestMethod)
+			fmt.Println("RequestPath:", entry.RequestPath)
+			fmt.Println("RequestProto:", entry.RequestProto)
+			fmt.Println("ReturnCode:", entry.ReturnCode)
+			fmt.Println("Size:", entry.Size)
+			fmt.Println("Referer:", entry.Referer)
+			fmt.Println("Agent:", entry.Agent)
+			fmt.Println("RequestType:", entry.RequestType)
+			fmt.Println("GivenType:", entry.GivenType)
+			fmt.Println("Region", entry.Region)
+			fmt.Println("Mirror:", entry.Mirror)
+			fmt.Println("Country:", entry.Country)
+			fmt.Println("Asn:", entry.Asn)
+			fmt.Println("Net:", entry.Net)
+			fmt.Println("RedirSize:", entry.RedirSize)
+			fmt.Println("RedirRange:", entry.RedirRange)
+
+			log.Fatal("Failed to parse:\n", line)
+		}
+
+		if matches(*entry) {
+			size, err := strconv.Atoi(entry.RedirSize)
+			if err != nil {
+				log.Print(entry)
+				log.Fatal("Failed to parse file size: ", entry.RedirSize)
+			}
+			sizeByMirror[entry.Mirror] += size
+		}
 	}
 
+	for key, value := range sizeByMirror {
+		fmt.Println("Mirror:", key, "Size:", value/1024/1024/1024, "gb")
+	}
 }
 
-/*
-next unless r.request_method == 'GET'
-next unless r.given_type == 'redirect'
-next unless CONG.match r.request_path
-#puts [r.mirror, r.redir_size].join(',')
-sums[r.mirror] += r.redir_size.to_i
+func matches(entry Entry) (bool) {
+	return  entry.RequestMethod == "GET" &&
+		entry.GivenType == "redirect" &&
+		//entry.RedirSize != "" &&
+		strings.Index(entry.RequestPath, PathFilter) > -1
+}
 
-sums.each { |m,s| 
-printf "%s = %d mb\n", m, s/1024/1024
-  }
-  */
